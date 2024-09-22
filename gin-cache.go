@@ -2,45 +2,60 @@ package gogincache
 
 import (
 	"bytes"
+	"context"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
-	"github.com/andomize/go-gin-cache/redis"
+	"github.com/andomize/go-gin-cache/clients"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
 
 type GinCache struct {
-	triggers map[string][]Trigger
-	pool     redis.Pool
+	triggersStats   map[string][]*TriggerStats
+	triggersStatsMx sync.Mutex
+	pool            clients.Pool
 }
 
-func New(pool redis.Pool) *GinCache {
+type TriggerStats struct {
+	trigger Trigger
+	urls    map[string]struct{}
+}
+
+func New(pool clients.Pool) *GinCache {
 	return &GinCache{
-		triggers: make(map[string][]Trigger),
-		pool:     pool,
+		triggersStats: make(map[string][]*TriggerStats, 0),
+		pool:          pool,
 	}
 }
 
 func (gc *GinCache) CacheRouter() gin.HandlerFunc {
 	return func(ctx *gin.Context) {
+		gc.triggersStatsMx.Lock()
+		defer gc.triggersStatsMx.Unlock()
 
 		// Просматриваем все зарегистрированные тригеры и если
 		// какой-либо из триггеров совпадает по условиям, то
-		// очищаем кеш для данного метода.
+		// очищаем все записи в кеше для данного триггера.
 
-		for handlerId, triggers := range gc.triggers {
-			for _, trigger := range triggers {
-				if trigger != nil && trigger.Comparable(ctx.Request) {
+		for _, triggerStats := range gc.triggersStats {
+			for _, triggerStat := range triggerStats {
+				if triggerStat.trigger.Comparable(ctx.Request) {
+					url := ctx.Request.URL.Path
 
-					// Если запрос попадает под условие зарегистрированного триггера,
-					// то используем идентификатор обработчика, что бы сбросить кеш.
-					conn := gc.pool.Get(ctx)
+					if _, has := triggerStat.urls[url]; has {
+						go func(key string) {
+							// Если запрос попадает под условие зарегистрированного триггера,
+							// то используем идентификатор обработчика, что бы сбросить кеш.
+							conn := gc.pool.Get(context.Background())
 
-					if err := conn.Del(genKey(handlerId, "*")); err != nil {
-						log.Printf("[gin-cache] error occured on conn.Del: %v", err)
-						return
+							if err := conn.Del(key); err != nil {
+								log.Printf("[gin-cache] error occured on conn.Del: %v", err)
+								return
+							}
+						}(url)
 					}
 				}
 			}
@@ -55,16 +70,15 @@ func (gc *GinCache) Cache(td time.Duration, triggers ...Trigger) gin.HandlerFunc
 	handlerId := uuid.New().String()
 
 	return func(ctx *gin.Context) {
-		uri := ctx.Request.RequestURI
 		method := ctx.Request.Method
+		uri := ctx.Request.URL.RequestURI()
+		url := ctx.Request.URL.Path
 
 		// Регистрация триггеров. При вызове стандартной 'CacheRouter' функции,
 		// будет выполнена проверка на соответствие всем зарегистрированным
 		// триггерам и очищены данные в кеше.
-		if gc.triggers[handlerId] == nil {
-			gc.triggers[handlerId] = make([]Trigger, len(triggers))
-			gc.triggers[handlerId] = append(gc.triggers[handlerId], triggers...)
-		}
+		gc.triggerStatsInit(handlerId, triggers...)
+		gc.triggerStatsSetURL(handlerId, url)
 
 		if method != http.MethodGet {
 			log.Printf("[gin-cache] The cache only supports the GET method")
@@ -72,13 +86,12 @@ func (gc *GinCache) Cache(td time.Duration, triggers ...Trigger) gin.HandlerFunc
 		}
 
 		conn := gc.pool.Get(ctx)
-		content, ok, err := conn.Get(genKey(handlerId, uri))
+		content, ok, err := conn.Get(uri)
 		if err != nil {
 			log.Printf("[gin-cache] error occured on conn.Get: %v", err)
 			return
 		}
 		if !ok {
-
 			blw := &bodyLogWriter{
 				body:           bytes.NewBufferString(""),
 				ResponseWriter: ctx.Writer,
@@ -86,16 +99,20 @@ func (gc *GinCache) Cache(td time.Duration, triggers ...Trigger) gin.HandlerFunc
 			ctx.Writer = blw
 			ctx.Next()
 
-			c := redis.Content{
+			rc := &clients.Content{
 				StatusCode:  ctx.Writer.Status(),
 				ContentType: ctx.Writer.Header().Get("Content-Type"),
 				Data:        blw.body.Bytes(),
 			}
-			err = conn.Set(genKey(handlerId, uri), &c, td)
-			if err != nil {
-				log.Printf("[gin-cache] error occured on conn.Set: %v", err)
-				return
-			}
+			go func(rc *clients.Content) {
+				conn := gc.pool.Get(context.Background())
+				err = conn.Set(uri, rc, td)
+				if err != nil {
+					log.Printf("[gin-cache] error occured on conn.Set: %v", err)
+					return
+				}
+			}(rc)
+
 			return
 		}
 
@@ -104,8 +121,38 @@ func (gc *GinCache) Cache(td time.Duration, triggers ...Trigger) gin.HandlerFunc
 	}
 }
 
-func genKey(handlerId, uri string) string {
-	return handlerId + ":" + uri
+func (gc *GinCache) triggerStatsInit(handlerId string, triggers ...Trigger) {
+	gc.triggersStatsMx.Lock()
+	defer gc.triggersStatsMx.Unlock()
+
+	if _, has := gc.triggersStats[handlerId]; has {
+		return
+	}
+
+	gc.triggersStats[handlerId] = make([]*TriggerStats, 0)
+	for _, trigger := range triggers {
+		if trigger == nil {
+			continue
+		}
+		gc.triggersStats[handlerId] = append(
+			gc.triggersStats[handlerId], &TriggerStats{
+				trigger: trigger,
+				urls:    make(map[string]struct{}),
+			})
+	}
+}
+
+func (gc *GinCache) triggerStatsSetURL(handlerId string, url string) {
+	gc.triggersStatsMx.Lock()
+	defer gc.triggersStatsMx.Unlock()
+
+	if _, has := gc.triggersStats[handlerId]; !has {
+		return
+	}
+
+	for _, triggerStat := range gc.triggersStats[handlerId] {
+		triggerStat.urls[url] = struct{}{}
+	}
 }
 
 type bodyLogWriter struct {

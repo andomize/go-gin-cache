@@ -7,7 +7,7 @@ import (
 	"time"
 
 	gogincache "github.com/andomize/go-gin-cache"
-	"github.com/andomize/go-gin-cache/redis/goredis/v9"
+	"github.com/andomize/go-gin-cache/clients/goredis/v9"
 	"github.com/gin-gonic/gin"
 	lib "github.com/redis/go-redis/v9"
 )
@@ -62,7 +62,8 @@ func main() {
 	router.POST("/users", handlerUserCreate())
 	router.PATCH("/users/:USER", handlerUserPatch())
 
-	router.Run() // listen and serve on 0.0.0.0:8080
+	go router.Run() // listen and serve on 0.0.0.0:8080
+	TesterRun()
 	time.Sleep(1 * time.Hour)
 }
 
@@ -88,15 +89,15 @@ func handlerUserGet() gin.HandlerFunc {
 func handlerUserCreate() gin.HandlerFunc {
 	return func(ctx *gin.Context) {
 		ctx.JSON(http.StatusCreated, gin.H{
-			"status": "ok"},
-		)
+			"status": "ok",
+		})
 	}
 }
 
 func handlerUserPatch() gin.HandlerFunc {
 	return func(ctx *gin.Context) {
 		ctx.JSON(http.StatusCreated, gin.H{
-			"status": "ok"},
-		)
+			"status": "ok",
+		})
 	}
 }

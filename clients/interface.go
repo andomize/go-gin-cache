@@ -1,4 +1,4 @@
-package redis
+package clients
 
 import (
 	"context"
@@ -14,7 +14,7 @@ type Pool interface {
 type Conn interface {
 	Get(key string) (*Content, bool, error)
 	Set(key string, content *Content, expiration time.Duration) error
-	Del(key string) error
+	Del(prefix string) error
 	Close() error
 }
 
