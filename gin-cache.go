@@ -43,9 +43,12 @@ func (gc *GinCache) CacheRouter() gin.HandlerFunc {
 		for _, triggerStats := range gc.triggersStats {
 			for _, triggerStat := range triggerStats {
 				if triggerStat.trigger.Comparable(ctx.Request) {
-					url := ctx.Request.URL.Path
+					// url := ctx.Request.URL.Path
+					// if _, has := triggerStat.urls[url]; !has {
+					// 	continue
+					// }
 
-					if _, has := triggerStat.urls[url]; has {
+					for url := range triggerStat.urls {
 						go func(key string) {
 							// Если запрос попадает под условие зарегистрированного триггера,
 							// то используем идентификатор обработчика, что бы сбросить кеш.
